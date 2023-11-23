@@ -1,8 +1,11 @@
 ﻿#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <pico/stdlib.h>
+#include <pico/util/queue.h>
+
 #include <hardware/uart.h>
 #include <hardware/irq.h>
 #include <hardware/gpio.h>
@@ -36,6 +39,9 @@ Message no_response = {
 Message message_queue[100];
 int message_queue_length = 0;
 
+// Message queue of incoming messages
+queue_t incoming_queue;
+
 // A list of up to 10 addresses that have been seen
 uint8_t seen_addresses[10];
 int seen_addresses_length = 0;
@@ -62,6 +68,60 @@ void add_seen_address(uint8_t address) {
     }
 }
 
+void send_response(Message *msg) {
+    // Send response
+    uint8_t response_buffer[MAX_DATA_LENGTH + 5];
+    size_t length = serialize_message(msg, response_buffer);
+
+    uart_tx_wait_blocking(UART_ID);
+
+    uart_putc_raw(UART_ID, response_buffer[0]);
+
+    uart_tx_wait_blocking(UART_ID);
+
+    hw_set_bits(&uart_get_hw(UART_ID)->lcr_h, UART_UARTLCR_H_EPS_BITS);
+
+    for (int i = 1; i < length; i++) {
+        uart_putc_raw(UART_ID, response_buffer[i]);
+    }
+    
+    uart_tx_wait_blocking(UART_ID);
+
+    hw_clear_bits(&uart_get_hw(UART_ID)->lcr_h, UART_UARTLCR_H_EPS_BITS);
+}
+
+void respond(uint8_t address) {
+    // Respond with message from queue or 0x00, 0xff
+    Message *response = NULL;
+
+    // check if we've seen this address before
+    if (is_seen_address(address)) {
+        // find first message in queue with matching address
+        for (int i = 0; i < message_queue_length; i++) {
+            if (message_queue[i].address == address) {
+                response = &message_queue[i];
+
+                // shift queue
+                for (int j = i; j < message_queue_length - 1; j++) {
+                    message_queue[j] = message_queue[j + 1];
+                }
+
+                message_queue_length--;
+                break;
+            }
+        }
+
+        if (response == NULL) {
+            // respond with 0x00, 0xff
+            response = &no_response;
+            response->address = address;
+            response->crc = crc16((uint8_t *)response, 3 + response->length);
+        }
+
+        send_response(response);
+    }
+}
+
 // RX interrupt handler
 void on_uart_rx() {
     while (uart_is_readable(UART_ID)) {
@@ -79,65 +139,11 @@ void on_uart_rx() {
             Message *msg = parse_byte(&com2bus_parser, ch);
 
             if (msg && check_crc(msg)) {
-                uint8_t buffer[sizeof(Message) + 1];
+                if (msg->type == 0x4c)
+                    respond(msg->address);
 
-                // if message type is 0x4c and payload is 0x00, respond with message from queue or 0x00, 0xff
-
-                // first check if we've seen this address before
-
-                if (msg->type == 0x4c) {
-                    Message *response = NULL;
-
-                    // check if we've seen this address before
-                    if (is_seen_address(msg->address)) {
-                        // find first message in queue with matching address
-                        for (int i = 0; i < message_queue_length; i++) {
-                            if (message_queue[i].address == msg->address) {
-                                response = &message_queue[i];
-
-                                // shift queue
-                                for (int j = i; j < message_queue_length - 1; j++) {
-                                    message_queue[j] = message_queue[j + 1];
-                                }
-
-                                message_queue_length--;
-                                break;
-                            }
-                        }
-
-                        if (response == NULL) {
-                            // respond with 0x00, 0xff
-                            response = &no_response;
-                            response->address = msg->address;
-                            response->crc = crc16((uint8_t *)response, 3 + response->length);
-                        }
-
-                        // Send response
-                        size_t length = serialize_message(response, buffer);
-
-                        uart_tx_wait_blocking(UART_ID);
-
-                        uart_putc_raw(UART_ID, buffer[0]);
-
-                        uart_tx_wait_blocking(UART_ID);
-
-                        hw_set_bits(&uart_get_hw(UART_ID)->lcr_h, UART_UARTLCR_H_EPS_BITS);
-
-                        for (int i = 1; i < length; i++) {
-                            uart_putc_raw(UART_ID, buffer[i]);
-                        }
-                        
-                        uart_tx_wait_blocking(UART_ID);
-
-                        hw_clear_bits(&uart_get_hw(UART_ID)->lcr_h, UART_UARTLCR_H_EPS_BITS);
-                    }
-                }
-
-                size_t length = serialize_message(msg, buffer);
-
-                for (int i = 0; i < length; i++) {
-                    putchar(buffer[i]);
-                }
+                // Copy to queue
+                queue_try_add(&incoming_queue, msg);
             }
         }
     }
@@ -183,30 +189,114 @@ int setup_uart() {
     uart_set_irq_enables(UART_ID, true, false);
 }
 
+size_t hexstring_to_bytes(const char *hexstring, uint8_t *buffer, size_t buffer_size) {
+    size_t count = 0;
+    const char *pos = hexstring;
+
+    // Check if each character is a valid hexadecimal digit.
+    while (pos[0] && pos[1] && count < buffer_size) {
+        if (!isxdigit(pos[0]) || !isxdigit(pos[1])) {
+            // Invalid character encountered
+            break;
+        }
+
+        char buf[5] = {'0', 'x', pos[0], pos[1], 0};
+        buffer[count] = (uint8_t)strtol(buf, NULL, 16);
+        
+        pos += 2; // Move to the next pair of characters.
+        count++;
+    }
+
+    return count;
+}
+
+size_t getline(char *line, size_t size) {
+    size_t count = 0;
+    char ch;
+
+    while (count < size - 1) {
+        ch = getchar();
+
+        if (ch == '\n' || ch == '\r') {
+            break;
+        }
+
+        line[count++] = ch;
+    }
+
+    line[count] = '\0';
+
+    return count;
+}
+
+void handle_line(char *line) {
+    // Parse line as hexstring
+    uint8_t buffer[1024];
+    memset(buffer, 0, sizeof buffer);
+
+    size_t length = hexstring_to_bytes(line, buffer, sizeof buffer);
+
+    if (length < 5)
+        return;
+
+    Message *msg = deserialize_message(buffer);
+
+    if (msg) {
+        if (check_crc(msg) && msg->type == 0x6c) {
+            // Copy to queue
+            memcpy(&message_queue[message_queue_length++], msg, sizeof(Message));
+
+            // Add address to seen list
+            add_seen_address(msg->address);
+        }
+
+        free(msg);
+    }
+}
 
 int main(void)
 {
     stdio_init_all();
 
+    queue_init(&incoming_queue, sizeof(Message), 100);
+
     setup_uart();
 
+    char linebuffer[1024];
+    size_t linebuffer_length = 0;
+
+    memset(linebuffer, 0, sizeof linebuffer);
+
     while (1) {
-        // Read from stdin
-        int ch = getchar();
-        if (frontend_parser.bytes_parsed == 0) {
-            parse_start(&frontend_parser, ch);
-        } else {
-            Message *msg = parse_byte(&frontend_parser, ch);
+        Message msg;
 
-            if (msg && check_crc(msg) && msg->type == 0x6c) {
-                // Copy to queue
-                memcpy(&message_queue[message_queue_length++], msg, sizeof(Message));
+        int ch = getchar_timeout_us(0);
 
-                // Add address to seen list
-                add_seen_address(msg->address);
-            }
+        if (ch == '\n' || ch == '\r' || strlen(linebuffer) == sizeof linebuffer - 1) {
+            if (strlen(linebuffer) > 0)
+                handle_line(linebuffer);
+
+            memset(linebuffer, 0, sizeof linebuffer);
+            linebuffer_length = 0;
+        } else if (ch != PICO_ERROR_TIMEOUT) {
+            linebuffer[linebuffer_length++] = ch;
         }
-    }
+
+        bool success = queue_try_remove(&incoming_queue, &msg);
+
+        if (success) {
+            uint8_t buffer[MAX_DATA_LENGTH + 5];
+            size_t length = serialize_message(&msg, buffer);
+
+            char hexstring[length * 2 + 1];
+
+            for (size_t i = 0; i < length; i++)
+                sprintf(&hexstring[i * 2], "%02x", buffer[i]);
+
+            printf("%s\n", hexstring);
+        }
+    
+    }   
 
     return 0;
 }

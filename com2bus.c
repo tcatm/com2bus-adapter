@@ -39,8 +39,6 @@ Message *parse_byte(Parser *parser, uint8_t byte) {
         parser->msg.address = byte;
     } else if (parser->bytes_parsed == 2) { // Third byte is the length.
         parser->msg.length = byte;
-        if (byte > MAX_DATA_LENGTH)
-            return 0; // Length is too long, abort.
     } else if (parser->bytes_parsed >= 3 && parser->bytes_parsed < (3 + parser->msg.length)) {
         // Subsequent bytes are data bytes.
         parser->msg.data[parser->bytes_parsed - 3] = byte;
@@ -81,9 +79,31 @@ uint16_t crc16(uint8_t *data, size_t length) {
     return crc;
 }
 
+uint16_t msg_crc(Message *msg) {
+    uint8_t buffer[MAX_DATA_LENGTH + 5];
+    serialize_message(msg, buffer);
+
+    return crc16(buffer, 3 + msg->length);
+}
+
 int check_crc(Message *msg) {
-    uint16_t crc = crc16((uint8_t *)msg, 3 + msg->length);
+    uint16_t crc = msg_crc(msg);
     return crc == msg->crc;
+}
+
+Message *deserialize_message(uint8_t *buffer) {
+    Message *msg = malloc(sizeof(Message));
+    
+    msg->type = buffer[0];
+    msg->address = buffer[1];
+    msg->length = buffer[2];
+    memcpy(msg->data, buffer + 3, msg->length);
+
+    // deserialize CRC as big endian
+    msg->crc = buffer[3 + msg->length] << 8;
+    msg->crc |= buffer[4 + msg->length];
+
+    return msg;
 }
 
 size_t serialize_message(Message *msg, uint8_t *buffer) {
@@ -109,9 +129,8 @@ void print_message(Message *msg) {
     printf("], crc=%04x ", msg->crc);
 
     // Valid in green, invalid in red.
-
-    uint16_t crc = crc16((uint8_t *)msg, 3 + msg->length);
-    if (check_crc(msg))
+    uint16_t crc = msg_crc(msg);
+    if (crc == msg->crc)
         printf("\033[32mvalid\033[0m\r\n");
     else
         printf("\033[31minvalid (should be %04x)\033[0m\r\n", crc);
